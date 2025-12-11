@@ -1,0 +1,10 @@
+streamlit
+librosa
+numpy
+scipy
+scikit-learn
+plotly
+pydub
+psycopg2-binary
+sqlalchemy
+soundfile
