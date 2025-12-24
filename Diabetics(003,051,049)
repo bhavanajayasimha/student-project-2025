@@ -1,1 +1,274 @@
 https://colab.research.google.com/drive/1ZItWm0RcrIbYfZQIywx84-QVWwqAPpD-?usp=sharing
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, confusion_matrix, classification_report,
+    roc_curve, auc, precision_recall_curve, average_precision_score
+)
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+from xgboost import XGBClassifier
+from imblearn.over_sampling import SMOTE
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+# 2) Load dataset
+DATA_PATH = "/content/diabetes.csv"
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(f"Dataset not found at {DATA_PATH}. Upload the CSV to this path.")
+df = pd.read_csv(DATA_PATH)
+print("Loaded dataset shape:", df.shape)
+display(df.head())
+
+# 3) Quick information
+print("\nColumns:", list(df.columns))
+print("\nInfo:")
+print(df.info())
+print("\nValue counts (target):")
+if "Outcome" in df.columns:
+    print(df["Outcome"].value_counts())
+else:
+    print("No column named 'Outcome' found — will try last column as target later.")
+
+# 4) Standard cleaning: replace medically impossible zeros with NaN
+zero_to_nan_cols = ['Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI']
+cols_present = [c for c in zero_to_nan_cols if c in df.columns]
+print("\nColumns where 0 -> NaN:", cols_present)
+for c in cols_present:
+    df[c] = df[c].replace(0, np.nan)
+
+print("\nMissing after 0->NaN:\n", df.isnull().sum())
+
+# 5) Impute missing numeric with median
+num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+for c in num_cols:
+    if df[c].isnull().sum() > 0:
+        med = df[c].median()
+        df[c] = df[c].fillna(med)
+        print(f"Filled {c} NaNs with median = {med}")
+
+# 6) Identify target column (prefer 'Outcome', else last column)
+possible_targets = ["Outcome","outcome","target","label","Result","result"]
+target_col = None
+for t in possible_targets:
+    if t in df.columns:
+        target_col = t
+        break
+if target_col is None:
+    target_col = df.columns[-1]
+print("\nUsing target column:", target_col)
+
+# 7) Features & labels
+X = df.drop(columns=[target_col])
+y = df[target_col].astype(int)  # ensure integer labels
+print("X shape:", X.shape, " y shape:", y.shape)
+display(X.head())
+
+# 8) Train-test split (stratify)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=RANDOM_STATE, stratify=y
+)
+print("\nTrain/test sizes:", X_train.shape, X_test.shape)
+
+# 9) Scale features
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# 10) Address imbalance with SMOTE (only on training data)
+sm = SMOTE(random_state=RANDOM_STATE)
+X_train_bal, y_train_bal = sm.fit_resample(X_train_scaled, y_train)
+print("\nAfter SMOTE:", np.bincount(y_train_bal), "Before:", np.bincount(y_train))
+
+# 11) Candidate models + parameter grids
+xgb = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=RANDOM_STATE)
+rf = RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1)
+lr = LogisticRegression(max_iter=2000, random_state=RANDOM_STATE)
+
+# Small but focused grids to limit compute while still tuning
+xgb_params = {
+    'n_estimators': [100, 200, 350],
+    'max_depth': [3, 4, 6],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'subsample': [0.7, 0.9],
+    'colsample_bytree': [0.7, 0.9]
+}
+
+rf_params = {
+    'n_estimators': [100, 200, 350],
+    'max_depth': [None, 6, 10],
+    'min_samples_split': [2, 4]
+}
+
+lr_params = {'C': [0.01, 0.1, 1, 10]}
+
+# 12) GridSearchCV on XGBoost (priority) and RandomForest
+print("\nTuning XGBoost (this may take several minutes)...")
+xgb_cv = GridSearchCV(xgb, xgb_params, cv=4, scoring='accuracy', n_jobs=-1, verbose=0)
+xgb_cv.fit(X_train_bal, y_train_bal)
+best_xgb = xgb_cv.best_estimator_
+print("XGB best params:", xgb_cv.best_params_)
+
+print("\nTuning RandomForest...")
+rf_cv = GridSearchCV(rf, rf_params, cv=4, scoring='accuracy', n_jobs=-1, verbose=0)
+rf_cv.fit(X_train_bal, y_train_bal)
+best_rf = rf_cv.best_estimator_
+print("RF best params:", rf_cv.best_params_)
+
+print("\nTuning LogisticRegression (fast)...")
+lr_cv = GridSearchCV(lr, lr_params, cv=4, scoring='accuracy', n_jobs=-1, verbose=0)
+lr_cv.fit(X_train_bal, y_train_bal)
+best_lr = lr_cv.best_estimator_
+print("LR best params:", lr_cv.best_params_)
+
+# 13) Optionally create a stacking ensemble of the best models
+estimators = [
+    ('xgb', best_xgb),
+    ('rf', best_rf)
+]
+stack = StackingClassifier(estimators=estimators, final_estimator=LogisticRegression(), n_jobs=-1, passthrough=False)
+print("\nTraining stacking ensemble...")
+stack.fit(X_train_bal, y_train_bal)
+
+# 14) Evaluate models on test set (use scaled X_test_scaled for all)
+models = {
+    'XGBoost': best_xgb,
+    'RandomForest': best_rf,
+    'LogisticRegression': best_lr,
+    'Stacking': stack
+}
+
+results = {}
+for name, model in models.items():
+    y_pred = model.predict(X_test_scaled)
+    acc = accuracy_score(y_test, y_pred)
+    cm = confusion_matrix(y_test, y_pred)
+    cr = classification_report(y_test, y_pred, digits=4)
+    roc_auc = None
+    if hasattr(model, "predict_proba"):
+        probs = model.predict_proba(X_test_scaled)[:,1]
+        fpr, tpr, _ = roc_curve(y_test, probs)
+        roc_auc = auc(fpr, tpr)
+    results[name] = {'accuracy': acc, 'confusion_matrix': cm, 'report': cr, 'roc_auc': roc_auc, 'probs': (probs if 'probs' in locals() else None)}
+    print(f"\n=== {name} ===")
+    print("Accuracy:", acc)
+    print("Confusion Matrix:\n", cm)
+    print("Classification Report:\n", cr)
+    print("ROC AUC:", roc_auc)
+
+# 15) Pick best model by accuracy
+best_model_name = max(results.keys(), key=lambda k: results[k]['accuracy'])
+best_model = models[best_model_name]
+print("\nBest model on test set:", best_model_name, "Accuracy:", results[best_model_name]['accuracy'])
+
+# 16) Save best model & scaler & results
+model_save_path = "/content/best_diabetes_model.pkl"
+scaler_save_path = "/content/scaler.pkl"
+joblib.dump(best_model, model_save_path)
+joblib.dump(scaler, scaler_save_path)
+print("Saved model to:", model_save_path)
+print("Saved scaler to:", scaler_save_path)
+
+# 17) Save requirements.txt
+requirements = ["pandas", "numpy", "scikit-learn", "matplotlib", "seaborn", "xgboost", "imbalanced-learn", "joblib"]
+with open('/content/requirements.txt', 'w') as f:
+    f.write("\n".join(requirements))
+print("Saved /content/requirements.txt")
+
+# 18) Plots for best model: confusion matrix, ROC, precision-recall, feature importance
+cm = results[best_model_name]['confusion_matrix']
+plt.figure(figsize=(5,4))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+plt.title(f"Confusion Matrix - {best_model_name}")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.show()
+
+# ROC curve (if available)
+roc_auc = results[best_model_name]['roc_auc']
+if roc_auc is not None:
+    probs = best_model.predict_proba(X_test_scaled)[:,1]
+    fpr, tpr, _ = roc_curve(y_test, probs)
+    plt.figure(figsize=(6,4))
+    plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.4f}")
+    plt.plot([0,1],[0,1],"--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC Curve - {best_model_name}")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Precision-Recall
+    precision, recall, _ = precision_recall_curve(y_test, probs)
+    ap = average_precision_score(y_test, probs)
+    plt.figure(figsize=(6,4))
+    plt.plot(recall, precision, label=f"AP = {ap:.4f}")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(f"Precision-Recall Curve - {best_model_name}")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No probability estimates available for ROC/PR plotting.")
+
+# Feature importance (try to use built-in for XGBoost or RF)
+try:
+    if best_model_name == 'XGBoost':
+        fi = best_model.feature_importances_
+        names = X.columns
+    elif best_model_name == 'RandomForest':
+        fi = best_model.feature_importances_
+        names = X.columns
+    else:
+        # For stacking or LR, show absolute coef of logistic regression if available
+        if hasattr(best_model, 'feature_importances_'):
+            fi = best_model.feature_importances_
+            names = X.columns
+        elif hasattr(best_model, 'coef_'):
+            fi = np.abs(best_model.coef_).ravel()
+            names = X.columns
+        else:
+            fi = None
+    if fi is not None:
+        idx = np.argsort(fi)
+        plt.figure(figsize=(8,5))
+        plt.barh(np.array(names)[idx], fi[idx])
+        plt.title(f"Feature importance - {best_model_name}")
+        plt.tight_layout()
+        plt.show()
+except Exception as e:
+    print("Could not plot feature importance:", e)
+
+# 19) Show final classification report for best model
+print("\nFinal Classification Report for best model:")
+y_pred_best = best_model.predict(X_test_scaled)
+print(classification_report(y_test, y_pred_best, digits=4))
+
+# 20) Example single-sample prediction (first test row)
+sample = X_test.iloc[0:1]
+print("\nSample features (first test row):")
+display(sample)
+sample_scaled = scaler.transform(sample)
+pred_class = best_model.predict(sample_scaled)[0]
+pred_prob = best_model.predict_proba(sample_scaled)[0][1] if hasattr(best_model, "predict_proba") else None
+print(f"Predicted class: {pred_class}  Predicted probability (positive class): {pred_prob}")
+
+# 21) Final note
+print("\nPipeline complete. If accuracy < 98% you can try:")
+print("- increase grid search ranges or iterations")
+print("- try more advanced ensembling or stacking (add LightGBM, CatBoost)")
+print("- use feature engineering or polynomial features")
+print("- cross-validate with different random seeds")
